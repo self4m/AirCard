@@ -2,6 +2,7 @@ import SwiftUI
 import AppKit
 import UniformTypeIdentifiers
 import CryptoKit
+import Darwin
 
 // MARK: - Models
 
@@ -573,13 +574,17 @@ class AppViewModel: ObservableObject {
     
     @Published var isFlashing = false
     @Published private(set) var downloadingCardIDs: Set<String> = []
+    var isDownloadingCardArtwork: Bool { !downloadingCardIDs.isEmpty }
+    @Published private(set) var isCancellingArtworkDownload = false
+    private var artworkDownloadProcess: Process?
     /// Cards whose pass bundle names a remote card-artwork asset on the iPhone.
     /// Only these can download their original card artwork, so only they get a button.
     @Published private(set) var remoteArtworkCardIDs: Set<String> = []
-    /// The device whose lookup link we currently keep (added feature).
+    /// Device associated with the cached lookup link.
     private var artworkLookupDeviceID: String?
     private var isProbingRemoteArtwork = false
     private var pendingRemoteArtworkProbe = false
+    private var remoteArtworkProbeFailures = 0
     /// Coalesces the probe requests a scan produces (one per detected card).
     private var remoteArtworkProbeDebounce: Task<Void, Never>?
     @Published var progress: Double = 0.0
@@ -784,6 +789,7 @@ class AppViewModel: ObservableObject {
         currentScanIDs = []
         currentPreloadedIDs = []
         pendingActivationIDs = []
+        remoteArtworkCardIDs = []
         loadSavedCards()
         saveCards()
         if udid != nil { scheduleRemoteArtworkProbe(after: 0) }
@@ -794,17 +800,11 @@ class AppViewModel: ObservableObject {
     private func releaseArtworkLookupLink(udid: String) {
         let scriptDir = self.scriptDir
         Task.detached {
-            let process = Process()
-            process.executableURL = AppViewModel.pythonExecutableURL
-            process.environment = AppViewModel.processEnvironment
-            process.currentDirectoryURL = URL(fileURLWithPath: scriptDir)
-            process.arguments = ["aircard_backend.py", "--release-artwork-link", udid]
-            process.standardOutput = Pipe()
-            process.standardError = Pipe()
-            guard (try? process.run()) != nil else { return }
-            process.waitUntilExit()
-            await MainActor.run {
-                self.log("Released the card artwork lookup link kept for the previous iPhone.")
+            let result = AppViewModel.runArtworkCommand(["--release-artwork-link", udid], scriptDir: scriptDir)
+            if !result.ok {
+                await MainActor.run {
+                    self.log("Artwork link cleanup failed: \(result.failure)")
+                }
             }
         }
     }
@@ -940,6 +940,7 @@ class AppViewModel: ObservableObject {
     }
 
     func addCardHash(_ raw: String) {
+        guard !isDownloadingCardArtwork else { return }
         let components = raw.components(separatedBy: CharacterSet(charactersIn: " \n\r\t,;"))
         var addedCount = 0
         for comp in components {
@@ -958,18 +959,21 @@ class AppViewModel: ObservableObject {
     }
     
     func deleteCard(id: String) {
+        guard !isDownloadingCardArtwork else { return }
         cards.removeAll { $0.id == id }
         saveCards()
         log("Removed card: \(id)")
     }
     
     func clearAllCards() {
+        guard !isDownloadingCardArtwork else { return }
         cards.removeAll()
         saveCards()
         log("Cleared all cards.")
     }
     
     func setCardImage(for cardId: String, url: URL) {
+        guard !isDownloadingCardArtwork else { return }
         if let idx = cards.firstIndex(where: { $0.id == cardId }) {
             cards[idx].customImageURL = url
             cards[idx].customImage = NSImage(contentsOf: url)
@@ -979,6 +983,7 @@ class AppViewModel: ObservableObject {
     }
     
     func clearCardImage(for cardId: String) {
+        guard !isDownloadingCardArtwork else { return }
         if let idx = cards.firstIndex(where: { $0.id == cardId }) {
             cards[idx].customImageURL = nil
             cards[idx].customImage = nil
@@ -1008,6 +1013,7 @@ class AppViewModel: ObservableObject {
     // MARK: - Device Connection
 
     func selectDevice(_ dev: DeviceInfo) {
+        guard !isDownloadingCardArtwork else { return }
         guard dev.udid != self.device?.udid else { return }
 
         if isScanningCards {
@@ -1034,7 +1040,7 @@ class AppViewModel: ObservableObject {
     }
 
     func checkDevice(preferredUDID: String? = nil) {
-        guard !isCheckingDevice, !isFlashing else { return }
+        guard !isCheckingDevice, !isFlashing, !isDownloadingCardArtwork else { return }
         isCheckingDevice = true
         statusText = "Checking connected devices..."
         let scriptDir = self.scriptDir
@@ -1220,7 +1226,7 @@ class AppViewModel: ObservableObject {
     }
     
     func startCardScanning() {
-        guard !isScanningCards, !isFlashing, !isCheckingDevice else { return }
+        guard !isScanningCards, !isFlashing, !isCheckingDevice, !isDownloadingCardArtwork else { return }
         guard let deviceHelper = AppViewModel.deviceHelperExecutableURL else {
             errorMessage = "Device tools are missing from this build."
             scannerMessage = "Device tools are missing. Rebuild or reinstall AirCard, then reconnect."
@@ -1400,6 +1406,7 @@ class AppViewModel: ObservableObject {
     // MARK: - Skin Application
     
     func applySkin() {
+        guard !isDownloadingCardArtwork else { return }
         guard let udid = device?.udid else {
             errorMessage = "No iPhone connected."
             return
@@ -1647,6 +1654,7 @@ class AppViewModel: ObservableObject {
     }
     
     func flashPasscodeTheme() {
+        guard !isDownloadingCardArtwork else { return }
         guard let theme = loadedPasscodeTheme else { return }
         guard let dev = device, dev.connected, let udid = dev.udid else {
             errorMessage = "Please connect and trust your iPhone first."
@@ -1873,6 +1881,7 @@ class AppViewModel: ObservableObject {
     }
     
     func flashCreatedTheme() {
+        guard !isDownloadingCardArtwork else { return }
         let keys = effectiveCreatorKeys
         guard !keys.isEmpty else {
             errorMessage = "Please add at least one key icon or import a poster image first."
@@ -1903,22 +1912,13 @@ class AppViewModel: ObservableObject {
         self.flashPasscodeTheme()
     }
 
-    /// Re-check eligibility as cards are identified. The relocated link is kept
-    /// between checks, so each repeat costs about a third of a second; when a
-    /// check is already running, one follow-up run is queued instead of a storm.
-    /// Asks for an availability check. Scanning detects cards in bursts (one per
-    /// card opened), so the request is coalesced: the check runs once, shortly
-    /// after the last request, instead of once per detected card.
+    /// Coalesce scan events and queue probes behind active transfers.
     func scheduleRemoteArtworkProbe(after delay: TimeInterval = 1.2) {
-        if !downloadingCardIDs.isEmpty {
-            // A transfer is in flight; look again once it finishes.
+        if isDownloadingCardArtwork || isProbingRemoteArtwork {
             pendingRemoteArtworkProbe = true
             return
         }
-        if isProbingRemoteArtwork {
-            pendingRemoteArtworkProbe = true
-            return
-        }
+        pendingRemoteArtworkProbe = false
         remoteArtworkProbeDebounce?.cancel()
         remoteArtworkProbeDebounce = Task { @MainActor in
             if delay > 0 {
@@ -1933,12 +1933,30 @@ class AppViewModel: ObservableObject {
         }
     }
 
+    /// Consume a queued request even after failure, with at most two retries.
+    func finishRemoteArtworkProbe(failed: Bool) {
+        isProbingRemoteArtwork = false
+        let pending = pendingRemoteArtworkProbe
+        pendingRemoteArtworkProbe = false
+        if failed {
+            remoteArtworkProbeFailures += 1
+            if remoteArtworkProbeFailures <= 2 {
+                log("Artwork check failed; retry \(remoteArtworkProbeFailures)/2.")
+                scheduleRemoteArtworkProbe(after: Double(remoteArtworkProbeFailures) * 2)
+            } else {
+                remoteArtworkProbeFailures = 0
+                log("Artwork check failed after two retries.")
+            }
+        } else {
+            remoteArtworkProbeFailures = 0
+            if pending { scheduleRemoteArtworkProbe() }
+        }
+    }
+
     /// Ask the iPhone which cards expose a remote card-artwork manifest.
     /// Those are the only cards that can download their original card artwork.
     func refreshRemoteArtworkAvailability() {
-        // Added housekeeping: drop the lookup link kept for a device we are no
-        // longer talking to. Done here rather than in activateCardDevice, which
-        // is upstream code, so every probe cleans up after the previous iPhone.
+        // Release the cached lookup link when switching devices.
         let currentDevice = device?.udid
         if let previous = artworkLookupDeviceID, previous != currentDevice {
             releaseArtworkLookupLink(udid: previous)
@@ -1948,8 +1966,7 @@ class AppViewModel: ObservableObject {
         guard let udid = device?.udid, !isProbingRemoteArtwork else { return }
         // Saved IDs warm the lookup link up early; only verified cards may show
         // a download button.
-        let verified = Set(currentVerifiedCards.map(\.id))
-        let probeIDs = Array(verified.union(cards.map(\.id))).prefix(100)
+        let probeIDs = cards.map(\.id).prefix(100)
         guard !probeIDs.isEmpty else {
             remoteArtworkCardIDs = []
             return
@@ -1957,177 +1974,81 @@ class AppViewModel: ObservableObject {
 
         isProbingRemoteArtwork = true
         let scriptDir = self.scriptDir
-        log("Checking which cards can download original card artworks...")
         Task.detached {
-            let process = Process()
-            process.executableURL = AppViewModel.pythonExecutableURL
-            process.environment = AppViewModel.processEnvironment
-            process.currentDirectoryURL = URL(fileURLWithPath: scriptDir)
-            process.arguments = ["aircard_backend.py", "--probe-card-artwork", udid] + probeIDs
-            let output = Pipe()
-            process.standardOutput = output
-            process.standardError = Pipe()
-            var available: Set<String> = []
-            var probeFailed = false
-            do {
-                try process.run()
-                process.waitUntilExit()
-                let data = output.fileHandleForReading.readDataToEndOfFile()
-                let lines = String(data: data, encoding: .utf8)?
-                    .split(whereSeparator: \.isNewline) ?? []
-                if let last = lines.last,
-                   let json = try? JSONSerialization.jsonObject(with: Data(last.utf8)) as? [String: Any] {
-                    probeFailed = (json["ok"] as? Bool) != true
-                    available = Set(json["available"] as? [String] ?? [])
-                } else {
-                    probeFailed = true
-                }
-            } catch {
-                probeFailed = true
-            }
-
-            let resolved = available
-            let failed = probeFailed
+            let result = AppViewModel.runArtworkCommand(
+                ["--probe-card-artwork", udid] + probeIDs, scriptDir: scriptDir)
+            let resolved = Set(result.json["available"] as? [String] ?? [])
+            let failed = !result.ok
             await MainActor.run {
-                self.isProbingRemoteArtwork = false
-                if failed {
-                    // Keep the buttons we already know about; the helper's
-                    // device gate is intermittent, so retry once shortly.
-                    self.log("Could not check card artwork availability on the iPhone; retrying.")
-                    if !self.pendingRemoteArtworkProbe {
-                        self.pendingRemoteArtworkProbe = true
-                        Task { @MainActor in
-                            try? await Task.sleep(nanoseconds: 2_000_000_000)
-                            guard self.pendingRemoteArtworkProbe else { return }
-                            self.pendingRemoteArtworkProbe = false
-                            self.scheduleRemoteArtworkProbe()
-                        }
-                    }
+                guard self.device?.udid == udid, self.activeCardDeviceID == udid else {
+                    self.finishRemoteArtworkProbe(failed: false)
+                    self.scheduleRemoteArtworkProbe(after: 0)
                     return
                 }
-                // A card may show a download button only when this iPhone has
-                // actually evidenced it: seen during the current scan, or verified
-                // and stored for this device earlier. IDs that were merely pasted
-                // (never seen in a scan) stay hidden. Using currentVerifiedCards
-                // alone would hide every card after a launch or device switch,
-                // because that set is cleared whenever scanning (re)starts.
-                var evidenced = Set(self.currentVerifiedCards.map(\.id))
-                evidenced.formUnion(self.cards.filter(\.confirmed).map(\.id))
-                self.remoteArtworkCardIDs = resolved.intersection(evidenced)
-                if self.remoteArtworkCardIDs.isEmpty {
-                    self.log("No card on this iPhone exposes a card artwork manifest.")
-                } else {
-                    self.log("\(self.remoteArtworkCardIDs.count) card(s) can download original card artworks.")
+                if failed {
+                    self.finishRemoteArtworkProbe(failed: true)
+                    return
                 }
-                if self.pendingRemoteArtworkProbe {
-                    self.pendingRemoteArtworkProbe = false
-                    self.scheduleRemoteArtworkProbe()
+                let previous = self.remoteArtworkCardIDs
+                self.remoteArtworkCardIDs = Set(resolved.filter { self.hasArtworkCardEvidence($0) })
+                if self.remoteArtworkCardIDs != previous {
+                    self.log("Artwork available for \(self.remoteArtworkCardIDs.count) card(s).")
                 }
+                self.finishRemoteArtworkProbe(failed: false)
             }
         }
     }
 
-    /// Result of one `--fetch-card-artwork` run. Touches no view state, so a
-    /// caller can run several in sequence without hopping actors in between.
-    struct ArtworkFetchOutcome {
-        var ok = false
-        var source = "Apple asset service"
-        var asset = "card artwork"
-        /// Extension of the bytes Apple served, sniffed by the backend.
-        var fileExtension = ".png"
-        var verified = false
-        var problems: [String] = []
-        var width = 0
-        var height = 0
-        var failure = "Could not download the original card artwork."
-    }
-
-    nonisolated private static func runArtworkFetch(
-        udid: String, cardID: String, outputPath: String, scriptDir: String
-    ) -> ArtworkFetchOutcome {
-        let process = Process()
+    /// Shared subprocess and JSON handling for artwork commands.
+    nonisolated private static func runArtworkCommand(
+        _ arguments: [String], scriptDir: String, process: Process = Process()
+    ) -> (json: [String: Any], ok: Bool, failure: String) {
         process.executableURL = pythonExecutableURL
         process.environment = processEnvironment
         process.currentDirectoryURL = URL(fileURLWithPath: scriptDir)
-        process.arguments = ["aircard_backend.py", "--fetch-card-artwork", udid, cardID, outputPath]
+        process.arguments = ["aircard_backend.py"] + arguments
         let output = Pipe()
         let errors = Pipe()
         process.standardOutput = output
         process.standardError = errors
-
-        var result: [String: Any] = [:]
-        var launchError: Error?
         do {
             try process.run()
-            process.waitUntilExit()
-            let data = output.fileHandleForReading.readDataToEndOfFile()
-            let lines = String(data: data, encoding: .utf8)?
-                .split(whereSeparator: \.isNewline) ?? []
-            if let last = lines.last,
-               let json = try? JSONSerialization.jsonObject(with: Data(last.utf8)) as? [String: Any] {
-                result = json
-            }
         } catch {
-            launchError = error
+            return ([:], false, error.localizedDescription)
         }
-
+        let data = output.fileHandleForReading.readDataToEndOfFile()
         let stderr = String(data: errors.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        let ok = launchError == nil && process.terminationStatus == 0
-            && (result["ok"] as? Bool == true)
-        let failure = (result["error"] as? String)
-            ?? (stderr.isEmpty
-                ? launchError?.localizedDescription ?? "Could not download the original card artwork."
-                : stderr)
-        return ArtworkFetchOutcome(
-            ok: ok,
-            source: result["source"] as? String ?? "Apple asset service",
-            asset: result["asset"] as? String ?? "card artwork",
-            fileExtension: result["extension"] as? String ?? ".png",
-            verified: result["verified"] as? Bool ?? false,
-            problems: result["problems"] as? [String] ?? [],
-            width: result["width"] as? Int ?? 0,
-            height: result["height"] as? Int ?? 0,
-            failure: failure)
+        process.waitUntilExit()
+        let last = String(data: data, encoding: .utf8)?.split(whereSeparator: \.isNewline).last
+        let json = last.flatMap { try? JSONSerialization.jsonObject(with: Data($0.utf8)) as? [String: Any] } ?? [:]
+        let failure = (json["error"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+            ?? (stderr.isEmpty ? "Card artwork command failed." : stderr)
+        return (json, process.terminationStatus == 0 && json["ok"] as? Bool == true, failure)
     }
 
-    /// Runs the batch command once for every requested card and returns one
-    /// summary line per card, so the UI can log them individually.
+    nonisolated private static func artworkDetail(_ json: [String: Any]) -> String {
+        var parts: [String] = []
+        if let width = json["width"] as? Int, let height = json["height"] as? Int,
+           width > 0, height > 0 { parts.append("\(width)x\(height)") }
+        parts.append((json["extension"] as? String ?? ".png").dropFirst().uppercased())
+        if let problems = json["problems"] as? [String], !problems.isEmpty {
+            parts.append("manifest mismatch: " + problems.joined(separator: "; "))
+        } else {
+            parts.append(json["verified"] as? Bool == true ? "verified" : "unverified")
+        }
+        return parts.joined(separator: " · ")
+    }
+
+    /// One backend process reads all manifests and returns per-card results.
     nonisolated private static func runArtworkFetchAll(
-        udid: String, cardIDs: [String], directory: String, scriptDir: String
+        udid: String, cardIDs: [String], directory: String, scriptDir: String, process: Process
     ) -> (saved: Int, results: [(String, Bool, String)], failure: String) {
-        let process = Process()
-        process.executableURL = pythonExecutableURL
-        process.environment = processEnvironment
-        process.currentDirectoryURL = URL(fileURLWithPath: scriptDir)
-        process.arguments = ["aircard_backend.py", "--fetch-card-artworks", udid, directory] + cardIDs
-        let output = Pipe()
-        let errors = Pipe()
-        process.standardOutput = output
-        process.standardError = errors
-
-        var summary: [String: Any] = [:]
-        var launchError: Error?
-        do {
-            try process.run()
-            process.waitUntilExit()
-            let data = output.fileHandleForReading.readDataToEndOfFile()
-            let lines = String(data: data, encoding: .utf8)?
-                .split(whereSeparator: \.isNewline) ?? []
-            if let last = lines.last,
-               let json = try? JSONSerialization.jsonObject(with: Data(last.utf8)) as? [String: Any] {
-                summary = json
-            }
-        } catch {
-            launchError = error
-        }
-
-        let stderr = String(data: errors.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?
-            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        let failure = (summary["error"] as? String).flatMap { $0.isEmpty ? nil : $0 }
-            ?? (stderr.isEmpty
-                ? launchError?.localizedDescription ?? "Could not download the original card artwork."
-                : stderr)
+        let command = runArtworkCommand(
+            ["--fetch-card-artworks", udid, directory] + cardIDs,
+            scriptDir: scriptDir, process: process)
+        let summary = command.json
+        let failure = command.failure
 
         var results: [(String, Bool, String)] = []
         for entry in summary["results"] as? [[String: Any]] ?? [] {
@@ -2135,14 +2056,7 @@ class AppViewModel: ObservableObject {
             let ok = entry["ok"] as? Bool ?? false
             let detail: String
             if ok {
-                let width = entry["width"] as? Int ?? 0
-                let height = entry["height"] as? Int ?? 0
-                let asset = entry["asset"] as? String ?? "card artwork"
-                let fileExtension = entry["extension"] as? String ?? ".png"
-                let verified = entry["verified"] as? Bool ?? false
-                detail = "\(width)x\(height) \(asset)"
-                    + (fileExtension != ".png" ? " \(fileExtension)" : "")
-                    + (verified ? " (verified)" : "")
+                detail = artworkDetail(entry)
             } else {
                 detail = entry["error"] as? String ?? failure
             }
@@ -2151,79 +2065,112 @@ class AppViewModel: ObservableObject {
         return (summary["saved"] as? Int ?? 0, results, failure)
     }
 
-    /// Reading pass files over AirTraffic competes with the log scanner for the
-    /// device transport, so a running scan is paused for the transfer instead of
-    /// refusing the download. The verified card list survives the pause, so the
-    /// grid and its buttons stay as they were.
+    /// Pause log streaming to avoid competing for the device transport.
     private func pauseScanForArtworkTransfer() {
         guard isScanningCards else { return }
-        log("Pausing the card scan for the card artwork download; press Scan Cards again to keep detecting.")
+        log("Scan paused for download.")
         stopCardScanning()
     }
 
     /// The asset is saved exactly as Apple served it, so a file the save panel
     /// named ".png" is renamed when the payload turns out to be another format.
-    private func matchExtension(of url: URL, to extension: String) -> URL {
+    func matchExtension(of url: URL, to extension: String) -> URL {
         let actual = `extension`.trimmingCharacters(in: CharacterSet(charactersIn: ".")).lowercased()
         guard !actual.isEmpty,
               actual != url.pathExtension.lowercased() else { return url }
-        let renamed = url.deletingPathExtension().appendingPathExtension(actual)
-        try? FileManager.default.removeItem(at: renamed)
-        guard (try? FileManager.default.moveItem(at: url, to: renamed)) != nil else { return url }
-        log("Saved as \(renamed.lastPathComponent): the asset is \(actual.uppercased()), not \(url.pathExtension.uppercased()).")
-        return renamed
+        let base = url.deletingPathExtension()
+        var suffix = 0
+        while true {
+            let candidate = suffix == 0 ? base : URL(fileURLWithPath: base.path + " (\(suffix))")
+            let renamed = candidate.appendingPathExtension(actual)
+            do {
+                // moveItem refuses an existing destination, including a race
+                // after the save panel closed. Preserve it and try a new name.
+                try FileManager.default.moveItem(at: url, to: renamed)
+                return renamed
+            } catch {
+                guard FileManager.default.fileExists(atPath: renamed.path),
+                      FileManager.default.fileExists(atPath: url.path) else { return url }
+                suffix += 1
+            }
+        }
     }
 
-    private func describe(_ outcome: ArtworkFetchOutcome) -> String {
-        var parts = ["\(outcome.width)x\(outcome.height)", outcome.asset, "from \(outcome.source)"]
-        if outcome.fileExtension != ".png" { parts.append(outcome.fileExtension) }
-        if outcome.verified {
-            parts.append("size+sha1 verified")
-        } else if !outcome.problems.isEmpty {
-            parts.append("MANIFEST MISMATCH: " + outcome.problems.joined(separator: "; "))
-        } else {
-            parts.append("no checksum declared")
+    func cancelArtworkDownload() {
+        guard isDownloadingCardArtwork, !isCancellingArtworkDownload,
+              let process = artworkDownloadProcess else { return }
+        isCancellingArtworkDownload = true
+        statusText = "Cancelling safely; keep the iPhone connected…"
+        log("Cancelling download safely…")
+        Task { @MainActor in
+            // A click can arrive before the detached task starts the backend.
+            while self.artworkDownloadProcess === process && !process.isRunning {
+                try? await Task.sleep(nanoseconds: 100_000_000)
+            }
+            if self.artworkDownloadProcess === process && process.isRunning {
+                AppViewModel.sendArtworkCancelSignal(process)
+            }
         }
-        return parts.joined(separator: " · ")
+    }
+
+    nonisolated static func sendArtworkCancelSignal(_ process: Process) {
+        // Process.terminate() also signals child processes on macOS. Only the
+        // Python parent should receive cancellation; device helpers must finish.
+        if process.isRunning { kill(process.processIdentifier, SIGTERM) }
+    }
+
+    func hasArtworkCardEvidence(_ cardID: String) -> Bool {
+        currentVerifiedCardIDs.contains(cardID) || confirmedCardIDs.contains(cardID)
     }
 
     func downloadOriginalCardArtwork(cardID: String, to destinationURL: URL) {
-        guard let udid = device?.udid, currentVerifiedCardIDs.contains(cardID) else {
+        guard !isDownloadingCardArtwork, !isFlashing, !isCheckingDevice else { return }
+        guard let udid = device?.udid, device?.connected == true,
+              activeCardDeviceID == udid, hasArtworkCardEvidence(cardID) else {
             errorMessage = "Reconnect the iPhone and scan this card before downloading its card artwork."
             return
         }
-        guard !downloadingCardIDs.contains(cardID) else { return }
         // Mark the transfer first: stopCardScanning() refreshes the eligibility
         // probe, which must queue behind this download instead of competing.
         downloadingCardIDs.insert(cardID)
         pauseScanForArtworkTransfer()
         showLogs = true
         statusText = "Downloading the original card artwork for \(cardID.prefix(10))..."
-        log("Downloading the original card artwork for \(cardID) to \(destinationURL.lastPathComponent)")
+        log("Downloading \(cardID.prefix(12))… → \(destinationURL.lastPathComponent)")
         let scriptDir = self.scriptDir
         let outputPath = destinationURL.path
+        let process = Process()
+        artworkDownloadProcess = process
+        isCancellingArtworkDownload = false
 
         Task.detached {
-            let outcome = AppViewModel.runArtworkFetch(
-                udid: udid, cardID: cardID, outputPath: outputPath, scriptDir: scriptDir)
+            let outcome = AppViewModel.runArtworkCommand(
+                ["--fetch-card-artwork", udid, cardID, outputPath], scriptDir: scriptDir, process: process)
             await MainActor.run {
                 self.downloadingCardIDs.remove(cardID)
+                let cancelled = self.isCancellingArtworkDownload
+                self.artworkDownloadProcess = nil
+                self.isCancellingArtworkDownload = false
                 if outcome.ok {
-                    let saved = self.matchExtension(of: destinationURL, to: outcome.fileExtension)
+                    let saved = self.matchExtension(of: destinationURL, to: outcome.json["extension"] as? String ?? ".png")
                     self.statusText = "Saved the original card artwork to \(saved.lastPathComponent)"
-                    self.log("Downloaded \(self.describe(outcome)) for \(cardID.prefix(12))...")
+                    self.log("Saved \(saved.lastPathComponent): \(AppViewModel.artworkDetail(outcome.json))")
+                } else if cancelled {
+                    self.statusText = "Card artwork download cancelled."
+                    self.log(self.statusText)
                 } else {
                     self.statusText = "Card artwork download failed."
                     self.errorMessage = outcome.failure
-                    self.log("Card artwork download failed for \(cardID.prefix(12))...: \(outcome.failure)")
+                    self.log("Download failed for \(cardID.prefix(12))…: \(outcome.failure)")
                 }
                 self.scheduleRemoteArtworkProbe()
             }
         }
     }
 
-    /// Downloads every card that exposed a artwork manifest, one at a time.
+    /// Download all eligible cards in one device transfer.
     func downloadAllCardArtwork(into directory: URL) {
+        guard !isDownloadingCardArtwork, !isFlashing, !isCheckingDevice else { return }
         guard let udid = device?.udid else {
             errorMessage = "No iPhone connected."
             return
@@ -2239,27 +2186,36 @@ class AppViewModel: ObservableObject {
 
         showLogs = true
         statusText = "Downloading card artwork for \(cardIDs.count) card(s)..."
-        log("Downloading card artwork for \(cardIDs.count) card(s) into \(directory.lastPathComponent)")
+        log("Downloading \(cardIDs.count) artwork file(s) → \(directory.lastPathComponent)")
         let scriptDir = self.scriptDir
 
+        let process = Process()
+        artworkDownloadProcess = process
+        isCancellingArtworkDownload = false
+
         Task.detached {
-            // One backend run for the whole batch: it reads every manifest in a
-            // single device round trip and downloads the covers in turn.
             let batch = AppViewModel.runArtworkFetchAll(
-                udid: udid, cardIDs: cardIDs, directory: directory.path, scriptDir: scriptDir)
+                udid: udid, cardIDs: cardIDs, directory: directory.path, scriptDir: scriptDir, process: process)
             let results = batch.results
             await MainActor.run {
                 for cardID in cardIDs { _ = self.downloadingCardIDs.remove(cardID) }
+                let cancelled = self.isCancellingArtworkDownload
+                self.artworkDownloadProcess = nil
+                self.isCancellingArtworkDownload = false
                 for (cardID, ok, detail) in results {
                     if ok {
-                        self.log("Saved artwork for \(cardID.prefix(8))...: \(detail)")
-                    } else {
-                        self.log("Artwork failed for \(cardID.prefix(8))...: \(detail)")
+                        self.log("Saved \(cardID.prefix(12))…: \(detail)")
+                    } else if !cancelled {
+                        self.log("Download failed for \(cardID.prefix(12))…: \(detail)")
                     }
                 }
                 self.statusText = "Saved \(batch.saved) of \(cardIDs.count) artwork file(s) to \(directory.lastPathComponent)"
-                if batch.saved == 0 && !batch.failure.isEmpty {
+                if cancelled {
+                    self.statusText = "Download cancelled. Kept \(batch.saved) saved artwork file(s)."
+                    self.log(self.statusText)
+                } else if batch.saved == 0 && !batch.failure.isEmpty {
                     self.errorMessage = batch.failure
+                    if results.isEmpty { self.log("Download failed: \(batch.failure)") }
                 } else if batch.saved < cardIDs.count {
                     self.errorMessage = "\(cardIDs.count - batch.saved) card artwork download(s) failed. See Log."
                 }
@@ -2270,10 +2226,9 @@ class AppViewModel: ObservableObject {
 
 }
 
-// MARK: - Artwork Download Controls (added)
+// MARK: - Artwork Download Controls
 
-/// Toolbar button that downloads the original card artwork for every card that
-/// exposes one. Kept as its own view so the main body stays cheap to type-check.
+/// Batch download button, separated to keep the main view easy to type-check.
 private struct ArtworkDownloadToolbarButton: View {
     let count: Int
     let isEnabled: Bool
@@ -2739,6 +2694,31 @@ struct ContentView: View {
                 .background(Color(NSColor.controlBackgroundColor))
         }
         .frame(minWidth: 880, minHeight: 680)
+        .disabled(vm.isDownloadingCardArtwork)
+        .overlay {
+            if vm.isDownloadingCardArtwork {
+                ZStack {
+                    Color.black.opacity(0.22)
+                        .contentShape(Rectangle())
+                        .onTapGesture { }
+                    VStack(spacing: 14) {
+                        ProgressView()
+                        Text(vm.isCancellingArtworkDownload ? "Cancelling safely…" : "Downloading card artwork…")
+                            .font(.headline)
+                        Text("Please wait. Keep your iPhone connected and unlocked.")
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                            .multilineTextAlignment(.center)
+                        Button("Cancel") { vm.cancelArtworkDownload() }
+                            .buttonStyle(.bordered)
+                            .disabled(vm.isCancellingArtworkDownload)
+                    }
+                    .padding(28)
+                    .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 16))
+                    .shadow(radius: 16)
+                }
+            }
+        }
         .alert("Something went wrong", isPresented: Binding(
             get: { vm.errorMessage != nil },
             set: { if !$0 { vm.errorMessage = nil } }
@@ -2777,8 +2757,7 @@ struct ContentView: View {
                 vm.statusText = "Ready"
             }
         }
-        // Added for the artwork download: the ".urls" state on the phone changes
-        // as Wallet renders cards, so re-check when this tab reappears.
+        // Wallet can update its manifests while rendering cards.
         .onChange(of: vm.selectedTab) { _, newTab in
             if newTab == .walletCards { vm.scheduleRemoteArtworkProbe(after: 0) }
         }

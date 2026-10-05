@@ -8,6 +8,7 @@ import os
 import plistlib
 import posixpath
 import secrets
+import shutil
 import stat
 import struct
 import subprocess
@@ -390,37 +391,45 @@ def read_files_batch(udid: str, target: str, leaves: list[str],
                 atc_cmd = [os.fspath(AIRTRAFFIC_HOST), udid]
                 for identifier, destination in zip(identifiers, destinations):
                     atc_cmd.extend((identifier, destination))
-                atc = run_json(atc_cmd, timeout=120)
+                try:
+                    atc = run_json(atc_cmd, timeout=120)
+                except Exception:
+                    _retain_batch_read_recovery(work, udid, source)
+                    return {}
                 if not (atc.get("exitCode") == 0 and atc.get("ok")):
-                    _abandon_batch_staging(udid, source, link_destination, recovered, snapshot_root)
-                    if attempt < retries:
-                        time.sleep(0.3 * attempt)
-                        continue
+                    # A failed helper may have moved some originals already.
+                    # Never delete its tree or repeat the move on uncertain state.
+                    _retain_batch_read_recovery(work, udid, source)
                     return {}
 
-                data: dict = {}
-                unread = []
-                for index, leaf in enumerate(leaves):
-                    local_out = work / f"recovered-{index}.bin"
-                    read = native("afc-read", udid, reads[index], os.fspath(local_out))
-                    if operation_ok(read) and local_out.is_file():
-                        data[leaf] = local_out.read_bytes()
-                    else:
-                        unread.append(leaf)
+                try:
+                    data: dict = {}
+                    unread = []
+                    for index, leaf in enumerate(leaves):
+                        local_out = work / f"recovered-{index}.bin"
+                        read = native("afc-read", udid, reads[index], os.fspath(local_out))
+                        if operation_ok(read) and local_out.is_file():
+                            data[leaf] = local_out.read_bytes()
+                        else:
+                            unread.append(leaf)
 
-                # Whatever came back is written to the phone again in one cycle.
-                restored = True
-                if data:
-                    restored = write_files_batch(udid, target, sorted(data.items()), retries=3)
+                    # Whatever came back is written to the phone again in one cycle.
+                    restored = True
+                    if data:
+                        restored = write_files_batch(udid, target, sorted(data.items()), retries=3)
 
-                if unread or not restored:
-                    # The unread originals are still in <source>/out/, so leave the
-                    # staging tree alone rather than deleting bytes we do not have.
+                    if unread or not restored:
+                        # The unread originals are still in <source>/out/, so leave the
+                        # staging tree alone rather than deleting bytes we do not have.
+                        _retain_batch_read_recovery(work, udid, source)
+                        return data if restored else {}
+
+                    native("finish-write", udid, source, link_destination, recovered,
+                           os.fspath(snapshot_root))
                     return data
-
-                native("finish-write", udid, source, link_destination, recovered,
-                       os.fspath(snapshot_root))
-                return data
+                except Exception:
+                    _retain_batch_read_recovery(work, udid, source)
+                    return {}
         except Exception:
             pass
         if attempt < retries:
@@ -436,6 +445,16 @@ def _abandon_batch_staging(udid: str, source: str, link_destination: str,
                os.fspath(snapshot_root))
     except Exception:
         pass
+
+
+def _retain_batch_read_recovery(work: Path, udid: str, source: str) -> None:
+    """Keep the Books preimage and staging identity for an uncertain transfer."""
+    recovery = Path(tempfile.mkdtemp(prefix="aircard-read-recovery-"))
+    shutil.copytree(work, recovery, dirs_exist_ok=True)
+    (recovery / "recovery.json").write_text(
+        json.dumps({"udid": udid, "source": source}), encoding="utf-8")
+    print(f"Card manifest transfer incomplete; device staging retained at {source}. "
+          f"Recovery snapshot: {recovery}", file=sys.stderr)
 
 
 STAT_LINK_CACHE = Path(tempfile.gettempdir()) / "aircard-stat-links.json"

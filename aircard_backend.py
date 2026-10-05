@@ -9,6 +9,7 @@ import io
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 import time
@@ -17,6 +18,18 @@ import urllib.request
 import zipfile
 from pathlib import Path
 from urllib.parse import urlparse
+
+# SIGTERM requests cancellation without interrupting manifest restoration.
+_artwork_cancel_requested = False
+
+
+def _request_artwork_cancel(signum, frame):
+    global _artwork_cancel_requested
+    _artwork_cancel_requested = True
+
+
+def _artwork_cancelled_result():
+    return {"ok": False, "cancelled": True, "error": "Card artwork download cancelled."}
 
 # Augment PATH so bundled tools and system tools are always found
 script_dir = Path(__file__).resolve().parent
@@ -408,6 +421,8 @@ def resolve_card_artwork(manifest: bytes) -> dict:
     problems = []
     host = ""
     for name in ordered_assets(entries):
+        if _artwork_cancel_requested:
+            return _artwork_cancelled_result()
         meta = entries.get(name) or {}
         url = meta.get("url")
         if not url:
@@ -421,6 +436,11 @@ def resolve_card_artwork(manifest: bytes) -> dict:
             attempts.append(f"{name}: {error}")
             continue
 
+        if _artwork_cancel_requested:
+            return _artwork_cancelled_result()
+        if not detect_asset_format(candidate):
+            attempts.append(f"{name}: not a usable image (PNG, PDF, JPEG or GIF expected)")
+            continue
         found = verify_declared(candidate, meta.get("size"), meta.get("sha1"))
         if found:
             attempts.append(f"{name}: {'; '.join(found)}")
@@ -469,6 +489,22 @@ def _valid_card_hash(card_hash: str) -> bool:
     return bool(re.fullmatch(r"[-A-Za-z0-9_+=]{20,64}", card_hash))
 
 
+def _artwork_export_result(resolved: dict, path: Path) -> dict:
+    return {
+        "ok": True,
+        "source": f"remote/{resolved['host']}",
+        "asset": resolved["asset"],
+        "extension": resolved["extension"],
+        "verified": resolved["verified"],
+        "problems": resolved["problems"],
+        "attempted": resolved["attempted"],
+        "bytes": len(resolved["data"]),
+        "width": resolved["width"],
+        "height": resolved["height"],
+        "path": str(path),
+    }
+
+
 def cmd_fetch_card_artwork(udid: str, card_hash: str, output_path: str) -> bool:
     """Download the original card face named by the card's remote asset manifest."""
     if not _valid_card_hash(card_hash):
@@ -489,6 +525,10 @@ def cmd_fetch_card_artwork(udid: str, card_hash: str, output_path: str) -> bool:
         manifests = {}
     manifest = manifests.get(f"{card_hash}.pkpass/{CARD_ARTWORK_MANIFEST}")
 
+    if _artwork_cancel_requested:
+        print(json.dumps(_artwork_cancelled_result()))
+        return False
+
     if not manifest:
         if not file_service_available(udid):
             print(json.dumps({
@@ -506,6 +546,9 @@ def cmd_fetch_card_artwork(udid: str, card_hash: str, output_path: str) -> bool:
         return False
 
     resolved = resolve_card_artwork(manifest)
+    if _artwork_cancel_requested:
+        print(json.dumps(_artwork_cancelled_result()))
+        return False
     if not resolved["ok"]:
         print(json.dumps({"ok": False, "error": resolved["error"],
                           "attempted": resolved.get("attempted", [])}))
@@ -517,19 +560,7 @@ def cmd_fetch_card_artwork(udid: str, card_hash: str, output_path: str) -> bool:
         print(json.dumps({"ok": False, "error": f"Could not save image: {error}"}))
         return False
 
-    print(json.dumps({
-        "ok": True,
-        "source": f"remote/{resolved['host']}",
-        "asset": resolved["asset"],
-        "extension": resolved["extension"],
-        "verified": resolved["verified"],
-        "problems": resolved["problems"],
-        "attempted": resolved["attempted"],
-        "bytes": len(resolved["data"]),
-        "width": resolved["width"],
-        "height": resolved["height"],
-        "path": str(destination),
-    }))
+    print(json.dumps(_artwork_export_result(resolved, destination)))
     return True
 
 
@@ -540,13 +571,10 @@ def cmd_fetch_card_artworks(udid: str, output_directory: str, card_hashes: list)
     verified by the same code path the single-card command uses. One failing card
     never stops the others.
     """
-    cards = [card for card in card_hashes if _valid_card_hash(card)]
-    if not cards:
+    if not card_hashes or not all(_valid_card_hash(card) for card in card_hashes):
         print(json.dumps({"ok": False, "error": "Invalid card ID"}))
         return False
-    if len(cards) != len(card_hashes):
-        print(json.dumps({"ok": False, "error": "Invalid card ID"}))
-        return False
+    cards = card_hashes
 
     directory = Path(output_directory).expanduser()
     if not directory.is_dir():
@@ -559,7 +587,7 @@ def cmd_fetch_card_artworks(udid: str, output_directory: str, card_hashes: list)
     except (OSError, RuntimeError, subprocess.SubprocessError, ValueError):
         manifests = {}
 
-    if not manifests and not file_service_available(udid):
+    if not _artwork_cancel_requested and not manifests and not file_service_available(udid):
         print(json.dumps({
             "ok": False,
             "error": ("The iPhone's file service is unavailable, so the passes cannot be "
@@ -571,6 +599,10 @@ def cmd_fetch_card_artworks(udid: str, output_directory: str, card_hashes: list)
     saved = 0
     for card in cards:
         entry = {"card": card}
+        if _artwork_cancel_requested:
+            entry.update(_artwork_cancelled_result())
+            results.append(entry)
+            continue
         manifest = manifests.get(f"{card}.pkpass/{CARD_ARTWORK_MANIFEST}")
         if not manifest:
             entry.update({"ok": False,
@@ -580,6 +612,10 @@ def cmd_fetch_card_artworks(udid: str, output_directory: str, card_hashes: list)
             continue
 
         resolved = resolve_card_artwork(manifest)
+        if _artwork_cancel_requested:
+            entry.update(_artwork_cancelled_result())
+            results.append(entry)
+            continue
         if not resolved["ok"]:
             entry.update({"ok": False, "error": resolved["error"],
                           "attempted": resolved.get("attempted", [])})
@@ -595,22 +631,12 @@ def cmd_fetch_card_artworks(udid: str, output_directory: str, card_hashes: list)
             continue
 
         saved += 1
-        entry.update({
-            "ok": True,
-            "source": f"remote/{resolved['host']}",
-            "asset": resolved["asset"],
-            "extension": resolved["extension"],
-            "verified": resolved["verified"],
-            "problems": resolved["problems"],
-            "bytes": len(resolved["data"]),
-            "width": resolved["width"],
-            "height": resolved["height"],
-            "path": str(path),
-        })
+        entry.update(_artwork_export_result(resolved, path))
         results.append(entry)
 
     print(json.dumps({
         "ok": saved > 0,
+        "cancelled": _artwork_cancel_requested,
         "saved": saved,
         "failed": len(cards) - saved,
         "checked": len(cards),
@@ -963,6 +989,8 @@ def main():
 
     cmd = sys.argv[1]
     norm_cmd = cmd.lstrip("-")
+    if norm_cmd in ("fetch-card-artwork", "fetch-card-artworks"):
+        signal.signal(signal.SIGTERM, _request_artwork_cancel)
     if norm_cmd == "device":
         target = sys.argv[2] if len(sys.argv) > 2 else None
         cmd_device(target)
