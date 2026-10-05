@@ -60,8 +60,8 @@ struct WalletSavedCard: Codable, Equatable {
     }
 }
 
-// A bare base64-like token in a Wallet log is not proof of a card.
-// Require a pass/cache path, and preserve first appearance across the line.
+// A bare base64-like token in a Wallet log is not proof of a card by itself.
+// Prefer structured pass/cache/dashboard paths, with fallback extraction for Wallet events.
 enum WalletScanParser {
     static let cardReferences = [
         try! NSRegularExpression(pattern: #"/([-A-Za-z0-9_+=]{20,64})\.(?:pkpass|cache|pkcache)(?=[/\s\"'\),]|$)"#),
@@ -70,15 +70,20 @@ enum WalletScanParser {
         try! NSRegularExpression(pattern: #"PDPassLibrary:\s*wrote pass\s+([-A-Za-z0-9_+=]{20,64})(?=[\s\"'\),]|$)"#, options: .caseInsensitive),
         try! NSRegularExpression(pattern: #"VerificationCheck\.([-A-Za-z0-9_+=]{20,64})(?=[\s\"'\),]|$)"#, options: .caseInsensitive),
         try! NSRegularExpression(pattern: #"selected pass uniqueID\s*:\s*\"?([-A-Za-z0-9_+=]{20,64})\"?"#, options: .caseInsensitive),
+        try! NSRegularExpression(pattern: #"Dashboard loading[^:]*:\s*for\s+([-A-Za-z0-9_+=]{20,80})(?=[,\s\"'\)]|$)"#, options: .caseInsensitive),
+        try! NSRegularExpression(pattern: #"Dashboard loading[^:]*:\s+([-A-Za-z0-9_+=]{20,80})\s+-"#, options: .caseInsensitive),
     ]
     static let inSessionList = try! NSRegularExpression(
-        pattern: #"passIDs\[InSession\]\s*:\s*(?:\{\s*)?\(([^)]*)\)"#,
+        pattern: #"passIDs\[(?:InSession|global)\]\s*:\s*(?:\{\s*)?\(([^)]*)\)"#,
         options: .caseInsensitive
     )
     static let cardID = try! NSRegularExpression(pattern: #"(?<![-A-Za-z0-9_+=])[-A-Za-z0-9_+=]{20,64}(?![-A-Za-z0-9_+=])"#)
     static let activation = try! NSRegularExpression(
-        pattern: #"setActivePaymentApplet.{0,4096}?requestedApplet\s*:.{0,4096}?identifier\s*=\s*([A-Fa-f0-9]{10,64})\b"#,
+        pattern: #"setActivePaymentApplet.{0,4096}?requestedApplet\s*:.{0,4096}?(?:identifier\s*=\s*|\"identifier\"\s*:\s*\")([A-Fa-f0-9]{10,64})\b"#,
         options: [.caseInsensitive, .dotMatchesLineSeparators]
+    )
+    static let fallbackToken = try! NSRegularExpression(
+        pattern: #"(?<![-A-Za-z0-9+/=])([A-Za-z0-9+/_-]{27}=)(?![-A-Za-z0-9+/=])"#
     )
     static let placeholders: Set<String> = ["OM6NYhwXMZrAw0sRUjR62wmF4ZQ=", "M6nDwZrkYbFlsodLgCbvyFZQ1cc=", "kJL-D0rr-SZhbj2c8nK-OQ9hCMY=", "hwAtAmHKYwsQrJbT5cTNDsaxVME="]
 
@@ -100,6 +105,17 @@ enum WalletScanParser {
         candidates.sort { $0.0 < $1.0 }
         var seen = Set<String>()
         return candidates.compactMap { _, id in
+            guard !placeholders.contains(id), seen.insert(id).inserted else { return nil }
+            return id
+        }
+    }
+
+    static func fallbackCardIDs(in line: String) -> [String] {
+        let lineRange = NSRange(line.startIndex..., in: line)
+        var seen = Set<String>()
+        return fallbackToken.matches(in: line, range: lineRange).compactMap { match in
+            guard let range = Range(match.range(at: 1), in: line) else { return nil }
+            let id = String(line[range])
             guard !placeholders.contains(id), seen.insert(id).inserted else { return nil }
             return id
         }

@@ -11,12 +11,16 @@ struct WalletDiscoveryTests {
         precondition(WalletScanParser.cardIDs(in: "passd identifier \(a)").isEmpty)
         precondition(WalletScanParser.cardIDs(in: "/Cards/<private>.pkpass").isEmpty)
         let ios27Line = "nfcd: passIDs[InSession]: {(\"\(c)\")} passIDs[global]: {(\"\(a)\")}"
-        precondition(WalletScanParser.cardIDs(in: ios27Line) == [c])
+        precondition(WalletScanParser.cardIDs(in: ios27Line) == [c, a])
         let sessionCards = (0..<12).map { String(format: "%020dAAAAAAA=", $0) }
         let sessionList = sessionCards.map { "\"\($0)\"" }.joined(separator: ", ")
         let batchedIOS27Line = "nfcd: passIDs[InSession]: {(\(sessionList))} passIDs[global]: {(\"\(a)\")}"
-        precondition(WalletScanParser.cardIDs(in: batchedIOS27Line) == sessionCards)
-        precondition(WalletScanParser.cardIDs(in: "nfcd: passIDs[global]: {(\"\(a)\")}").isEmpty)
+        precondition(WalletScanParser.cardIDs(in: batchedIOS27Line) == sessionCards + [a])
+        precondition(WalletScanParser.cardIDs(in: "nfcd: passIDs[global]: {(\"\(a)\")}") == [a])
+        let dashboardLine1 = "Passbook(PassKitUI): Dashboard loading (...): for \(a), pass feature unknown"
+        let dashboardLine2 = "Passbook(PassKitUI): Dashboard loading (...): \(b) - m:NO, sm:NO"
+        precondition(WalletScanParser.cardIDs(in: dashboardLine1) == [a])
+        precondition(WalletScanParser.cardIDs(in: dashboardLine2) == [b])
         precondition(WalletScanParser.cardIDs(in: "Wallet /Passes/Cards/\(a)/FrontFace") == [a])
         precondition(WalletScanParser.cardIDs(in: "PDCardFileManager: writing card \(b)") == [b])
         precondition(WalletScanParser.cardIDs(in: "PDPassLibrary: wrote pass \(a)") == [a])
@@ -28,6 +32,10 @@ struct WalletDiscoveryTests {
         precondition(WalletScanParser.activationIDs(in: activeLine) == [activation])
         let multilineActivation = "setActivePaymentApplet: x requestedApplet:\n<NFApplet> { identifier = \(activation) family=0x0 }"
         precondition(WalletScanParser.activationIDs(in: multilineActivation) == [activation])
+        let jsonActivation = "setActivePaymentApplet: x requestedApplet: {\"identifier\":\"\(activation)\",\"family\":0}"
+        precondition(WalletScanParser.activationIDs(in: jsonActivation) == [activation])
+        let fallbackLine = "passd: some unusual event \(c) without explicit path"
+        precondition(WalletScanParser.fallbackCardIDs(in: fallbackLine) == [c])
         let cards = [WalletSavedCard(id: b, confirmed: true, imagePath: "/skin-b.png", selected: false),
                      WalletSavedCard(id: a, imagePath: "/skin-a.png"),
                      WalletSavedCard(id: b), WalletSavedCard(id: a, confirmed: true)]

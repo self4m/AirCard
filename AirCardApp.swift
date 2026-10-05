@@ -945,14 +945,15 @@ class AppViewModel: ObservableObject {
         for comp in components {
             let clean = comp.trimmingCharacters(in: .whitespacesAndNewlines).trimmingCharacters(in: CharacterSet(charactersIn: "."))
             if clean.count >= 16 && clean.count <= 64 && !cards.contains(where: { $0.id == clean }) {
-                cards.append(CardItem(id: clean, isSelected: true, displayName: walletCatalog.name(for: clean)))
+                cards.append(CardItem(id: clean, isSelected: true, displayName: walletCatalog.name(for: clean), confirmed: true))
+                currentPreloadedIDs.insert(clean)
                 addedCount += 1
                 log("Added card: \(clean)")
             }
         }
         if addedCount > 0 {
             saveCards()
-            scannerMessage = "Saved \(addedCount) ID(s) for matching. They stay hidden until this iPhone exposes them in a scan."
+            scannerMessage = "Added \(addedCount) card ID(s) ready for skinning and flashing."
         }
     }
     
@@ -1051,12 +1052,14 @@ class AppViewModel: ObservableObject {
             }
 
             let pipe = Pipe()
+            let errPipe = Pipe()
             process.standardOutput = pipe
-            process.standardError = FileHandle.nullDevice
+            process.standardError = errPipe
 
             do {
                 try process.run()
                 let data = pipe.fileHandleForReading.readDataToEndOfFile()
+                let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
                 process.waitUntilExit()
 
                 if let resp = try? JSONDecoder().decode(DeviceResponse.self, from: data) {
@@ -1129,19 +1132,36 @@ class AppViewModel: ObservableObject {
                     }
                 } else {
                     // Nothing parseable came back, which means the backend did not
-                    // run, not that the cable is loose. Saying "no iPhone" here
-                    // sends people to replug a phone that was never the problem.
+                    // run, not that the cable is loose.
                     let raw = String(data: data, encoding: .utf8) ?? ""
+                    let errRaw = (String(data: errData, encoding: .utf8) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+                    let errLower = errRaw.lowercased()
+                    let isLicenseOrCLT = errLower.contains("license") ||
+                                         errLower.contains("xcode-select") ||
+                                         errLower.contains("commandlinetools") ||
+                                         errLower.contains("xcrun")
+
                     await MainActor.run {
                         self.devices = []
                         self.device = nil
                         self.activateCardDevice(nil)
                         self.refreshWalletCatalog()
                         self.isCheckingDevice = false
-                        self.statusText = "Device detection could not run. See the log."
-                        self.errorMessage = "AirCard could not run its device tools. The app may be damaged or incompletely installed."
-                        self.scannerMessage = "Device check failed. Reconnect and unlock the iPhone, then retry."
-                        self.log("Device detection returned nothing usable: \(raw.isEmpty ? "(no output)" : raw.prefix(400).description)")
+                        if isLicenseOrCLT {
+                            self.statusText = "Command Line Tools required."
+                            self.errorMessage = "AirCard needs Xcode Command Line Tools to communicate with devices.\n\nPlease open Terminal and run:\nxcode-select --install\n\nor open Xcode to accept the license agreement, then restart AirCard."
+                            self.scannerMessage = "Developer tools or license agreement required. See log."
+                        } else {
+                            self.statusText = "Device detection could not run. See the log."
+                            self.errorMessage = errRaw.isEmpty
+                                ? "AirCard could not run its device tools. Check the Activity Console log for details."
+                                : "Device tool error: \(errRaw.prefix(300))"
+                            self.scannerMessage = "Device check failed. Reconnect and unlock the iPhone, then retry."
+                        }
+                        if !errRaw.isEmpty {
+                            self.log("Backend stderr: \(errRaw)")
+                        }
+                        self.log("Device detection returned nothing usable: \(raw.isEmpty ? "(no stdout)" : raw.prefix(400).description)")
                     }
                 }
             } catch {
@@ -1153,6 +1173,7 @@ class AppViewModel: ObservableObject {
                     self.isCheckingDevice = false
                     self.scannerMessage = "Device check failed. Reconnect and unlock the iPhone, then retry."
                     self.statusText = "Device detection failed: \(error.localizedDescription)"
+                    self.log("Process execution failed: \(error.localizedDescription)")
                 }
             }
         }
@@ -1312,7 +1333,11 @@ class AppViewModel: ObservableObject {
                             }
                         }
                         
-                        for candidate in WalletScanParser.cardIDs(in: line) {
+                        var candidates = WalletScanParser.cardIDs(in: line)
+                        if candidates.isEmpty {
+                            candidates = WalletScanParser.fallbackCardIDs(in: line)
+                        }
+                        for candidate in candidates {
                             await MainActor.run {
                                 guard self.scanProcess === proc else { return }
                                 self.recordPreloadedCard(candidate)
@@ -1379,14 +1404,13 @@ class AppViewModel: ObservableObject {
             errorMessage = "No iPhone connected."
             return
         }
-        let verifiedIDs = currentVerifiedCardIDs
-        let allSkinned = cards.filter { verifiedIDs.contains($0.id) && $0.isSelected && $0.customImageURL != nil }
+        let allSkinned = cards.filter { $0.isSelected && $0.customImageURL != nil }
         guard !allSkinned.isEmpty else {
             errorMessage = "Please assign a skin image to at least one selected card."
             return
         }
         // Only flash changed skins; if nothing changed, re-flash everything selected.
-        let changed = cardsNeedingFlash.filter { verifiedIDs.contains($0.id) }
+        let changed = cardsNeedingFlash
         let selectedCardsWithSkin = changed.isEmpty ? allSkinned : changed
         
         isFlashing = true
@@ -2272,6 +2296,7 @@ struct WalletCardView: View {
     @Binding var card: CardItem
     let cardIndex: Int
     var isFlashed: Bool = false
+    var isVerified: Bool = true
     let onPickImage: () -> Void
     let onClearImage: () -> Void
     let onDelete: () -> Void
@@ -2446,9 +2471,19 @@ struct WalletCardView: View {
                     .font(.system(size: 13, weight: .semibold))
                     .lineLimit(2)
                     .help(card.displayName ?? "No matching name in the Mac cache. The card ID is preserved.")
-                Text("Matched to this iPhone in the current scan")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
+                if isVerified {
+                    Text("Matched to this iPhone in current scan")
+                        .font(.caption2)
+                        .foregroundStyle(.green)
+                } else if card.confirmed {
+                    Text("Saved on this iPhone")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                } else {
+                    Text("Manually added · Ready to flash")
+                        .font(.caption2)
+                        .foregroundStyle(.orange)
+                }
                 if card.customImageURL != nil && card.customImage == nil {
                     Text("Skin file unavailable. Choose the image again.")
                         .font(.caption2).foregroundStyle(.orange)
@@ -2532,18 +2567,76 @@ struct WalletCardView: View {
     }
 }
 
+// MARK: - Crypto Donation Row (macOS)
+
+struct CryptoDonationRowMac: View {
+    let title: String
+    let address: String
+    let icon: String
+    let iconColor: Color
+
+    @State private var isCopied = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            HStack {
+                Image(systemName: icon)
+                    .foregroundColor(iconColor)
+                    .font(.system(size: 13, weight: .bold))
+                Text(title)
+                    .font(.system(size: 12, weight: .semibold))
+                Spacer()
+                Button(action: {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(address, forType: .string)
+                    NSHapticFeedbackManager.defaultPerformer.perform(.generic, performanceTime: .default)
+                    withAnimation(.easeInOut(duration: 0.15)) {
+                        isCopied = true
+                    }
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
+                        withAnimation {
+                            isCopied = false
+                        }
+                    }
+                }) {
+                    HStack(spacing: 4) {
+                        Image(systemName: isCopied ? "checkmark" : "doc.on.doc")
+                        Text(isCopied ? "Copied!" : "Copy")
+                    }
+                    .font(.system(size: 10, weight: .bold))
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .tint(isCopied ? .green : .blue)
+            }
+
+            Text(address)
+                .font(.system(size: 10, design: .monospaced))
+                .foregroundColor(.secondary)
+                .lineLimit(1)
+                .textSelection(.enabled)
+        }
+        .padding(10)
+        .background(Color(NSColor.controlBackgroundColor))
+        .cornerRadius(8)
+    }
+}
+
 // MARK: - Main UI View
 
 struct ContentView: View {
     @StateObject private var vm = AppViewModel()
+    @AppStorage("aircard.dont_show_support_on_launch") private var dontShowSupportOnLaunch: Bool = false
+    @State private var showSupportPopup = false
     @State private var showCredits = false
+    @State private var creditsSelectedTab = 0
     @State private var dragOffsetStart: CGPoint = .zero
     @State private var dragKeyStartOffsets: [String: CGPoint] = [:]
     @State private var isTargetedPoster = false
     @State private var isTargetedTheme = false
     
     private var readyToFlashCount: Int {
-        vm.currentVerifiedCards.filter { $0.isSelected && $0.customImageURL != nil }.count
+        vm.cards.filter { $0.isSelected && $0.customImageURL != nil }.count
     }
     
     private var changedCount: Int { vm.cardsNeedingFlash.count }
@@ -2587,7 +2680,7 @@ struct ContentView: View {
             // 4. Main Workspace
             if vm.selectedTab == .walletCards {
                 ScrollView {
-                    if vm.currentVerifiedCards.isEmpty {
+                    if vm.cards.isEmpty {
                         emptyStateView
                             .padding(.top, 40)
                     } else {
@@ -2595,13 +2688,14 @@ struct ContentView: View {
                             columns: [GridItem(.adaptive(minimum: 310, maximum: 360), spacing: 20)],
                             spacing: 20
                         ) {
-                            ForEach(Array(vm.currentVerifiedCards.enumerated()), id: \.element.id) { visibleIndex, verifiedCard in
-                                let cardID = verifiedCard.id
+                            ForEach(Array(vm.cards.enumerated()), id: \.element.id) { visibleIndex, cardItem in
+                                let cardID = cardItem.id
                                 let deviceID = vm.device?.udid
                                 WalletCardView(
-                                    card: walletCardBinding(in: $vm.cards, snapshot: verifiedCard),
+                                    card: walletCardBinding(in: $vm.cards, snapshot: cardItem),
                                     cardIndex: visibleIndex,
-                                    isFlashed: vm.isSkinFlashed(verifiedCard),
+                                    isFlashed: vm.isSkinFlashed(cardItem),
+                                    isVerified: vm.currentVerifiedCardIDs.contains(cardID),
                                     onPickImage: { openCardImagePicker(for: cardID) },
                                     onClearImage: { vm.clearCardImage(for: cardID) },
                                     onDelete: { vm.deleteCard(id: cardID) },
@@ -2659,14 +2753,21 @@ struct ContentView: View {
             if vm.selectedTab == .passcodeThemes {
                 Text("Passcode theme successfully applied!\n\nLock your iPhone (or restart) to see your new passcode keypad.")
             } else {
-                Text("Skins successfully applied to all selected cards!\n\nPlease force-close the Wallet app on your iPhone (or reboot) to see your new designs.")
+                Text("Skins successfully applied to all selected cards!\n\nPlease force-close the Wallet app on your iPhone (or reboot) to see your new designs.\n\nNote: Apple Card renders dynamically and its face color reflects your spending categories rather than static cached skins.")
             }
         }
-        .sheet(isPresented: $showCredits) {
-            creditsSheet
+        .sheet(isPresented: $showSupportPopup) {
+            supportPopupSheet
         }
         .sheet(isPresented: $vm.showAddCardSheet) {
             addCardSheet
+        }
+        .onAppear {
+            if !dontShowSupportOnLaunch {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
+                    showSupportPopup = true
+                }
+            }
         }
         .onChange(of: vm.selectedTab) { _, newTab in
             if newTab == .passcodeThemes && vm.isScanningCards {
@@ -2698,7 +2799,7 @@ struct ContentView: View {
                     Text("AirCard")
                         .font(.title2)
                         .fontWeight(.bold)
-                    Text("v1.2.5")
+                    Text("v1.2.6")
                         .font(.system(size: 10, weight: .bold, design: .rounded))
                         .padding(.horizontal, 6)
                         .padding(.vertical, 2)
@@ -2818,11 +2919,14 @@ struct ContentView: View {
             .cornerRadius(16)
             
             Button(action: { showCredits = true }) {
-                Label("Credits", systemImage: "heart.fill")
+                Label("Credits & Donate", systemImage: "heart.fill")
                     .foregroundColor(.pink)
             }
             .buttonStyle(.bordered)
             .controlSize(.regular)
+            .sheet(isPresented: $showCredits) {
+                creditsSheet
+            }
         }
         .controlSize(.regular)
         .frame(height: 54)
@@ -2863,7 +2967,7 @@ struct ContentView: View {
                     action: downloadAllCardArtwork)
             }
             
-            if !vm.currentVerifiedCards.isEmpty {
+            if !vm.cards.isEmpty {
                 Button(action: openBulkImagePicker) {
                     Label("Set Skin for All...", systemImage: "photo.on.rectangle.angled")
                 }
@@ -2874,11 +2978,10 @@ struct ContentView: View {
             
             Spacer()
             
-            if !vm.currentVerifiedCards.isEmpty {
+            if !vm.cards.isEmpty {
                 HStack(spacing: 8) {
                     Button("Select All") {
-                        let verifiedIDs = vm.currentVerifiedCardIDs
-                        for idx in vm.cards.indices where verifiedIDs.contains(vm.cards[idx].id) {
+                        for idx in vm.cards.indices {
                             vm.cards[idx].isSelected = true
                         }
                     }
@@ -2888,8 +2991,7 @@ struct ContentView: View {
                     Text("·").foregroundColor(.secondary)
                     
                     Button("Deselect All") {
-                        let verifiedIDs = vm.currentVerifiedCardIDs
-                        for idx in vm.cards.indices where verifiedIDs.contains(vm.cards[idx].id) {
+                        for idx in vm.cards.indices {
                             vm.cards[idx].isSelected = false
                         }
                     }
@@ -4088,8 +4190,9 @@ struct ContentView: View {
                                 .font(.system(size: 10))
                                 .foregroundColor(.secondary)
                         }
-                    } else if !vm.currentVerifiedCards.isEmpty {
-                        Text("\(vm.currentVerifiedCards.filter { $0.isSelected }.count) of \(vm.currentVerifiedCards.count) verified cards selected · \(changedCount) changed · \(readyToFlashCount - changedCount) already on iPhone")
+                    } else if !vm.cards.isEmpty {
+                        let selectedCount = vm.cards.filter { $0.isSelected }.count
+                        Text("\(selectedCount) of \(vm.cards.count) cards selected · \(changedCount) changed · \(readyToFlashCount - changedCount) already on iPhone")
                             .font(.system(size: 10))
                             .foregroundColor(.secondary)
                     }
@@ -4198,66 +4301,266 @@ struct ContentView: View {
     
     // MARK: - Sheets & Pickers
     
-    private var creditsSheet: some View {
-        VStack(spacing: 16) {
-            Image(systemName: "creditcard.circle.fill")
-                .font(.system(size: 44))
-                .foregroundColor(.accentColor)
-            
-            Text("AirCard")
-                .font(.title2)
-                .fontWeight(.bold)
-            
-            Text("Apple Wallet Skins & Passcode Themes for iOS 18+")
-                .font(.caption)
-                .foregroundColor(.secondary)
-            
-            Divider()
-            
-            VStack(alignment: .leading, spacing: 12) {
-                HStack {
-                    Image(systemName: "person.crop.circle.fill")
+    @ViewBuilder
+    private var macDonateContentView: some View {
+        VStack(spacing: 12) {
+            // Creator Card
+            VStack(alignment: .leading, spacing: 10) {
+                HStack(spacing: 10) {
+                    Image(systemName: "heart.circle.fill")
+                        .font(.system(size: 34))
+                        .foregroundColor(.pink)
+
+                    VStack(alignment: .leading, spacing: 2) {
+                        HStack(spacing: 6) {
+                            Text("Maksym Reva")
+                                .font(.system(size: 14, weight: .bold))
+                            Text("🇺🇦")
+                                .font(.system(size: 13))
+                        }
+                        Text("@mak5er • Lead Developer")
+                            .font(.system(size: 11))
+                            .foregroundColor(.secondary)
+                    }
+                    Spacer()
+                }
+
+                // Social Links
+                HStack(spacing: 8) {
+                    Link(destination: URL(string: "https://x.com/mak5er")!) {
+                        HStack(spacing: 4) {
+                            Image(systemName: "bubble.left.and.bubble.right.fill")
+                            Text("Twitter / X")
+                        }
+                        .font(.system(size: 11, weight: .semibold))
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 6)
+                        .background(Color.blue.opacity(0.12))
                         .foregroundColor(.blue)
-                    Text("Developer:")
-                        .fontWeight(.medium)
-                    Link("@mak5er", destination: URL(string: "https://github.com/mak5er")!)
-                    Text("·")
-                        .foregroundColor(.secondary)
-                    Link("Twitter / X", destination: URL(string: "https://x.com/mak5er")!)
-                }
-                
-                HStack {
-                    Image(systemName: "person.crop.circle.fill")
-                        .foregroundColor(.blue)
-                    Text("Developer:")
-                        .fontWeight(.medium)
-                    Link("@Lumid-Off", destination: URL(string: "https://github.com/Lumid-Off")!)
-                    Text("·")
-                        .foregroundColor(.secondary)
-                    Link("Twitter / X", destination: URL(string: "https://x.com/LumidOff")!)
-                }
-                
-                HStack {
-                    Image(systemName: "bolt.shield.fill")
-                        .foregroundColor(.orange)
-                    Text("Core Exploit:")
-                        .fontWeight(.medium)
-                    Text("airlift (AirTraffic sync escape)")
-                        .foregroundColor(.secondary)
-                }
-                
-                HStack {
-                    Image(systemName: "lock.shield.fill")
-                        .foregroundColor(.purple)
-                    Text("Passcode Themes:")
-                        .fontWeight(.medium)
-                    Text(".passthm standard (Cowabunga / Nugget)")
-                        .foregroundColor(.secondary)
+                        .cornerRadius(6)
+                    }
+
+                    Link(destination: URL(string: "https://github.com/mak5er")!) {
+                        HStack(spacing: 4) {
+                            Image(systemName: "link")
+                            Text("GitHub")
+                        }
+                        .font(.system(size: 11, weight: .semibold))
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 6)
+                        .background(Color.primary.opacity(0.08))
+                        .foregroundColor(.primary)
+                        .cornerRadius(6)
+                    }
                 }
             }
-            .font(.subheadline)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(.horizontal, 8)
+            .padding(12)
+            .background(Color(NSColor.controlBackgroundColor))
+            .cornerRadius(10)
+
+            // Payment Methods
+            VStack(alignment: .leading, spacing: 8) {
+                Text("DONATE & SUPPORT")
+                    .font(.system(size: 10, weight: .bold))
+                    .foregroundColor(.secondary)
+                    .padding(.horizontal, 2)
+
+                // PayPal Button
+                Link(destination: URL(string: "https://www.paypal.com/donate/?hosted_button_id=98QRTC2HFRA4Y")!) {
+                    HStack(spacing: 8) {
+                        Image(systemName: "creditcard.fill")
+                            .font(.system(size: 14))
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text("Donate with PayPal")
+                                .font(.system(size: 12, weight: .bold))
+                            Text("Recipient: Maksym Reva")
+                                .font(.system(size: 10))
+                                .opacity(0.85)
+                        }
+                        Spacer()
+                        Image(systemName: "arrow.up.right.square")
+                            .font(.system(size: 12))
+                    }
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 8)
+                    .foregroundColor(.white)
+                    .background(Color.blue)
+                    .cornerRadius(8)
+                }
+
+                // TON
+                CryptoDonationRowMac(
+                    title: "💎 TON (The Open Network)",
+                    address: "UQBm9KPhtMw-XVVjirUoa09wzrlyWsbeZhKfefl1Uw-qNZ-r",
+                    icon: "diamond.fill",
+                    iconColor: .cyan
+                )
+
+                // USDT TRC20
+                CryptoDonationRowMac(
+                    title: "💵 USDT (TRC20)",
+                    address: "TDkDMCyjYxgvkWUnQiF5Erk2RyPQMT6G1n",
+                    icon: "dollarsign.circle.fill",
+                    iconColor: .green
+                )
+
+                // BEP20
+                CryptoDonationRowMac(
+                    title: "🪙 BEP20 (BNB / USDT)",
+                    address: "0x0954dc491c502849d04956ef74634aa5931a08e8",
+                    icon: "bitcoinsign.circle.fill",
+                    iconColor: .orange
+                )
+            }
+
+            Text("Thank you for supporting AirCard development! ❤️")
+                .font(.system(size: 11))
+                .foregroundColor(.secondary)
+                .multilineTextAlignment(.center)
+        }
+    }
+
+    private var supportPopupSheet: some View {
+        VStack(spacing: 14) {
+            // Header
+            VStack(spacing: 4) {
+                Image(systemName: "heart.circle.fill")
+                    .font(.system(size: 40))
+                    .foregroundColor(.pink)
+
+                Text("Welcome to AirCard!")
+                    .font(.title2)
+                    .fontWeight(.bold)
+
+                Text("Free & Open Source • Developed by @mak5er")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            }
+
+            Divider()
+
+            macDonateContentView
+
+            Divider()
+
+            VStack(spacing: 8) {
+                Button("Continue to AirCard") {
+                    showSupportPopup = false
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.regular)
+                .frame(maxWidth: .infinity)
+
+                Toggle("Don't show this popup on startup", isOn: $dontShowSupportOnLaunch)
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+
+                Text("You can reopen donation options anytime in Credits & Donate ❤️")
+                    .font(.system(size: 10))
+                    .foregroundColor(.secondary)
+            }
+        }
+        .padding(20)
+        .frame(width: 440)
+    }
+
+    private var creditsSheet: some View {
+        VStack(spacing: 14) {
+            Picker("Category", selection: $creditsSelectedTab) {
+                Text("Credits").tag(0)
+                Text("Donate ❤️").tag(1)
+            }
+            .pickerStyle(.segmented)
+            .padding(.horizontal, 4)
+
+            Divider()
+
+            if creditsSelectedTab == 0 {
+                VStack(spacing: 16) {
+                    Image(systemName: "creditcard.circle.fill")
+                        .font(.system(size: 40))
+                        .foregroundColor(.accentColor)
+                    
+                    Text("AirCard")
+                        .font(.title2)
+                        .fontWeight(.bold)
+                    
+                    Text("Apple Wallet Skins & Passcode Themes for iOS 18+")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                    
+                    // Button to Donate
+                    Button(action: {
+                        withAnimation {
+                            creditsSelectedTab = 1
+                        }
+                    }) {
+                        HStack(spacing: 8) {
+                            Image(systemName: "heart.fill")
+                                .foregroundColor(.pink)
+                            Text("Support @mak5er (Donate ❤️)")
+                                .fontWeight(.semibold)
+                            Spacer()
+                            Image(systemName: "chevron.right")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
+                        .padding(8)
+                        .background(Color.pink.opacity(0.1))
+                        .cornerRadius(8)
+                    }
+                    .buttonStyle(.plain)
+
+                    Divider()
+                    
+                    VStack(alignment: .leading, spacing: 10) {
+                        HStack {
+                            Image(systemName: "person.crop.circle.fill")
+                                .foregroundColor(.blue)
+                            Text("Developer:")
+                                .fontWeight(.medium)
+                            Link("@mak5er", destination: URL(string: "https://github.com/mak5er")!)
+                            Text("·")
+                                .foregroundColor(.secondary)
+                            Link("Twitter / X", destination: URL(string: "https://x.com/mak5er")!)
+                        }
+                        
+                        HStack {
+                            Image(systemName: "person.crop.circle.fill")
+                                .foregroundColor(.blue)
+                            Text("Developer:")
+                                .fontWeight(.medium)
+                            Link("@Lumid-Off", destination: URL(string: "https://github.com/Lumid-Off")!)
+                            Text("·")
+                                .foregroundColor(.secondary)
+                            Link("Twitter / X", destination: URL(string: "https://x.com/LumidOff")!)
+                        }
+                        
+                        HStack {
+                            Image(systemName: "bolt.shield.fill")
+                                .foregroundColor(.orange)
+                            Text("Core Exploit:")
+                                .fontWeight(.medium)
+                            Text("airlift (AirTraffic sync escape)")
+                                .foregroundColor(.secondary)
+                        }
+                        
+                        HStack {
+                            Image(systemName: "lock.shield.fill")
+                                .foregroundColor(.purple)
+                            Text("Passcode Themes:")
+                                .fontWeight(.medium)
+                            Text(".passthm standard (Cowabunga / Nugget)")
+                                .foregroundColor(.secondary)
+                        }
+                    }
+                    .font(.subheadline)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 8)
+                }
+            } else {
+                macDonateContentView
+            }
             
             Divider()
             
@@ -4267,8 +4570,8 @@ struct ContentView: View {
             .buttonStyle(.borderedProminent)
             .controlSize(.regular)
         }
-        .padding(24)
-        .frame(width: 420)
+        .padding(20)
+        .frame(width: 440)
     }
     
     private var addCardSheet: some View {
@@ -4351,7 +4654,7 @@ struct ContentView: View {
         panel.canChooseDirectories = false
         panel.message = "Choose a skin to assign to all selected cards..."
         if panel.runModal() == .OK, let url = panel.url {
-            for card in vm.currentVerifiedCards where card.isSelected {
+            for card in vm.cards where card.isSelected {
                 vm.setCardImage(for: card.id, url: url)
             }
         }

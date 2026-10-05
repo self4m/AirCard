@@ -816,13 +816,8 @@ def write_files_batch(
     return False
 
 
-def remove_files(udid: str, target: str, leaves: list[str], retries: int = 3) -> bool:
-    """Remove specific files through the relocated Airlift symlink.
-
-    Wallet only rebuilds its rendered card faces when the old cache entries are
-    absent. Overwriting them with arbitrary bytes leaves stale artwork active on
-    recent iOS releases, so cache invalidation must be a real unlink operation.
-    """
+def remove_files_batch(udid: str, target: str, leaves: list[str], retries: int = 3) -> bool:
+    """Remove specific files through the relocated Airlift symlink in a single batch."""
     if not leaves:
         return True
     if any(not leaf or "/" in leaf or leaf in {".", ".."} for leaf in leaves):
@@ -890,6 +885,33 @@ def remove_files(udid: str, target: str, leaves: list[str], retries: int = 3) ->
             pass
         if attempt < retries:
             time.sleep(0.4 * attempt)
+    return False
+
+
+def remove_files(udid: str, target: str, leaves: list[str], retries: int = 3) -> bool:
+    """Remove specific files through the relocated Airlift symlink.
+
+    Wallet only rebuilds its rendered card faces when the old cache entries are
+    absent. Overwriting them with arbitrary bytes leaves stale artwork active on
+    recent iOS releases, so cache invalidation must be a real unlink operation.
+    """
+    if not leaves:
+        return True
+
+    # 1. Try removing all requested leaves in a fast single batch
+    if remove_files_batch(udid, target, leaves, retries=retries):
+        return True
+
+    # 2. If the combined batch fails (e.g. PlaceHolder or Preview does not exist
+    # on this device/card), remove present leaves individually.
+    if len(leaves) > 1:
+        removed_any = False
+        for leaf in leaves:
+            if remove_files_batch(udid, target, [leaf], retries=1):
+                removed_any = True
+        if removed_any:
+            return True
+
     return False
 
 

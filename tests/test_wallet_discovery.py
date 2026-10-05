@@ -35,3 +35,7 @@ class WalletDiscoveryTests(unittest.TestCase):
                             '-o', binary], capture_output=True, text=True, check=True)
             result = subprocess.run([binary], capture_output=True, text=True, check=True)
             self.assertIn('clear/relaunch passed', result.stdout)
+
+
+if __name__ == '__main__':
+    unittest.main()

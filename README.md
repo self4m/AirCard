@@ -50,6 +50,12 @@ Wallet setup, detailed troubleshooting, multi-card workflows, theme creation, co
 >   sudo xattr -cr /Applications/AirCard.app
 >   ```
 
+> [!TIP]
+> **macOS Developer Tools / Python Requirement:**
+> AirCard uses macOS native Python 3 (`/usr/bin/python3`). If macOS prompts that Developer Tools are required or if you recently installed/updated Xcode:
+> - Install Command Line Tools: `xcode-select --install`
+> - Accept Xcode license if applicable: `sudo xcodebuild -license accept`
+
 > [!NOTE]
 > **Windows users:** an unofficial Windows port is available at [**AirCard-Windows**](https://github.com/Lumid-Off/AirCard-Windows).
 
@@ -65,6 +71,10 @@ Wallet setup, detailed troubleshooting, multi-card workflows, theme creation, co
 4. Click on any card mockup or drag & drop an image directly onto the card.
 5. Click **Flash Skins**.
 6. Force-close the **Wallet** app on your iPhone from the App Switcher (or reboot) to see your new custom card design!
+
+> [!NOTE]
+> **Apple Card:**
+> The Apple Card (titanium/digital card) uses dynamic vector rendering based on your spending categories instead of static cached card skins. Custom skins apply to standard debit/credit cards, transit cards, and passes.
 
 ### Card names and missing-card checks
 

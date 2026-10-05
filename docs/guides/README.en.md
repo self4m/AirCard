@@ -38,7 +38,7 @@ Original card artwork for this guide. Use the links below to download them. If G
 | Card | A card already added to Apple Wallet |
 | App | Download `AirCard.dmg` from the [original releases page](https://github.com/Mak5er/AirCard/releases/latest); the DMG needs no separate Homebrew or Python installation |
 
-This guide was checked against **AirCard v1.2.5** on **2026-09-30**. The upstream README reports testing on iOS 27; that is not a guarantee for every device. No additional hardware compatibility testing was performed for this guide.
+This guide was checked against **AirCard v1.2.6** on **2026-10-04**. The upstream README reports testing on iOS 27; that is not a guarantee for every device. No additional hardware compatibility testing was performed for this guide.
 
 ## Change your card artwork in five steps
 
